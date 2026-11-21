@@ -5,3 +5,7 @@ scipy
 geopandas
 rasterio
 matplotlib
+pillow
+folium
+branca
+streamlit-folium
