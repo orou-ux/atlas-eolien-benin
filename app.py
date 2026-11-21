@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 # Compatibilité NumPy >= 2.0 et < 2.0
-_trapezoid = getattr(np, "trapezoid", np.trapz)
+_trapezoid = np.trapezoid if hasattr(np, "trapezoid") else getattr(np, "trapz")
 
 # ==============================================================================
 # CONFIGURATION DE LA PAGE
