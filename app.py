@@ -18,7 +18,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as pe
 import folium
-import branca.colormap as cm_branca
 from streamlit_folium import st_folium
 import streamlit as st
 
@@ -38,10 +37,10 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 1.1rem; padding-bottom: 1.5rem; }
+        .block-container { padding-top: 1.0rem; padding-bottom: 1.4rem; }
         .atlas-banner {
             background: linear-gradient(135deg, #1a237e 0%, #283593 60%, #1565c0 100%);
-            padding: 16px 22px;
+            padding: 15px 20px;
             border-radius: 10px;
             margin-bottom: 14px;
             box-shadow: 0 3px 10px rgba(26, 35, 126, 0.18);
@@ -55,7 +54,7 @@ st.markdown(
         }
         .atlas-banner p {
             color: #dbeafe;
-            margin: 5px 0 0 0;
+            margin: 4px 0 0 0;
             text-align: center;
             font-size: 13.5px;
         }
@@ -76,6 +75,34 @@ st.markdown(
             font-size: 12.5px;
             color: #ffffff;
             margin-left: 8px;
+        }
+        .legend-box {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-top: -6px;
+        }
+        .legend-title {
+            font-size: 12.5px;
+            font-weight: 700;
+            color: #1e293b;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .legend-bar {
+            height: 14px;
+            border-radius: 4px;
+            border: 1px solid #cbd5e1;
+        }
+        .legend-ticks {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11.5px;
+            color: #334155;
+            font-weight: 600;
+            margin-top: 4px;
         }
     </style>
     <div class="atlas-banner">
@@ -130,7 +157,23 @@ SCENARIOS = {
     "Horizon 2060 — Vision Alafia SSP5-8.5 (+4,5%)": 1.045,
 }
 
-# Positions extérieures avec lignes de rappel pour les 6 petits départements du Sud (évite toute surcharge)
+# Fonds de carte mondiaux 100 % gratuits et sans clé API (avec pays voisins et océan)
+FONDS_CARTE = {
+    "Plan Mondial & Relief (Esri Topo)": {
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Tiles © Esri — World Topo Map",
+    },
+    "Carte Routière & Pays (OpenStreetMap)": {
+        "tiles": "OpenStreetMap",
+        "attr": "© OpenStreetMap contributors",
+    },
+    "Vue Satellite du Globe (Esri Imagery)": {
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Tiles © Esri — World Imagery",
+    },
+}
+
+# Positions extérieures avec lignes de rappel pour les 6 petits départements du Sud (Carte Atlas HD)
 CALLOUTS_SUD = {
     "couffo":     {"xytext": (1.02, 7.18), "ha": "right"},
     "kouffo":     {"xytext": (1.02, 7.18), "ha": "right"},
@@ -143,7 +186,7 @@ CALLOUTS_SUD = {
 
 
 # ==============================================================================
-# FONCTIONS UTILITAIRES & TRAITEMENTS SPATIAUX (MIS EN CACHE)
+# FONCTIONS UTILITAIRES & TRAITEMENTS SPATIAUX (ORIENTATION NORD-SUD GARANTIE)
 # ==============================================================================
 def normaliser_nom(texte):
     txt = unicodedata.normalize("NFKD", str(texte)).encode("ascii", "ignore").decode("ascii")
@@ -151,7 +194,6 @@ def normaliser_nom(texte):
 
 
 def qualifier_gisement(dpe):
-    """Qualification énergétique du gisement éolien à partir de la DPE (W/m²)."""
     if dpe < 100:
         return "Classe 1 — Faible (Petit éolien / Hybride)", "#64748b"
     elif dpe < 200:
@@ -178,22 +220,42 @@ def charger_geojson(path):
 
 @st.cache_data
 def charger_raster_brut(path):
+    """
+    Charge le GeoTIFF et corrige automatiquement son orientation s'il est stocké
+    Sud -> Nord (transform.e > 0). Retourne toujours :
+    - data orienté Nord (ligne 0) -> Sud (dernière ligne)
+    - extent = [west, east, south, north] avec south < north garanti
+    - transform_std standard Nord -> Sud
+    """
     with rasterio.open(path) as src:
         data = src.read(1).astype(np.float32)
         if src.nodata is not None:
             data[data == src.nodata] = np.nan
-        extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
-        transform = src.transform
-    return data, extent, transform
+
+        west = min(src.bounds.left, src.bounds.right)
+        east = max(src.bounds.left, src.bounds.right)
+        south = min(src.bounds.bottom, src.bounds.top)
+        north = max(src.bounds.bottom, src.bounds.top)
+
+        # Redressement automatique si le raster était stocké à l'envers (Sud -> Nord)
+        if src.transform.e > 0:
+            data = np.flipud(data)
+        if src.transform.a < 0:
+            data = np.fliplr(data)
+
+        nrows, ncols = data.shape
+        transform_std = from_bounds(west, south, east, north, ncols, nrows)
+        extent = [west, east, south, north]
+    return data, extent, transform_std
 
 
 @st.cache_data
 def preparer_raster_lisse_clippe(tif_path, geojson_path):
-    """Lissage bilinéaire haute qualité et découpage strict sur les frontières exactes du Bénin."""
+    """Lissage bilinéaire et découpage strict sur les frontières exactes du Bénin."""
     data, extent, _ = charger_raster_brut(tif_path)
     gdf_benin, _ = charger_geojson(geojson_path)
+    west, east, south, north = extent
 
-    # Remplissage temporaire des NaN par plus proche voisin pour éviter l'érosion des bords au lissage
     mask_nan = np.isnan(data)
     if np.any(mask_nan) and not np.all(mask_nan):
         _, indices = distance_transform_edt(mask_nan, return_indices=True)
@@ -201,14 +263,12 @@ def preparer_raster_lisse_clippe(tif_path, geojson_path):
     else:
         data_filled = data.copy()
 
-    # Facteur d'agrandissement adaptatif (cible ~520 px de haut pour rapidité et netteté)
-    facteur = float(np.clip(520.0 / max(data.shape[0], 1), 1.0, 8.0))
+    facteur = float(np.clip(540.0 / max(data.shape[0], 1), 1.0, 10.0))
     data_smooth = zoom(data_filled, zoom=facteur, order=1)
 
     new_h, new_w = data_smooth.shape
-    new_transform = from_bounds(extent[0], extent[2], extent[1], extent[3], new_w, new_h)
+    new_transform = from_bounds(west, south, east, north, new_w, new_h)
 
-    # Découpage topologique strict sur les frontières du Bénin
     masque_benin = geometry_mask(
         gdf_benin.geometry,
         out_shape=(new_h, new_w),
@@ -219,12 +279,26 @@ def preparer_raster_lisse_clippe(tif_path, geojson_path):
     return data_clip, extent
 
 
-def creer_image_overlay_uri(data_clip, vmin, vmax, cmap_nom="YlOrRd"):
-    """Convertit le raster découpé en image PNG transparente encodée en base64 pour Folium."""
+def projeter_en_web_mercator(data_clip, south, north):
+    """Aligne exactement les latitudes du PNG sur la projection Web Mercator de Folium/Leaflet."""
+    h = data_clip.shape[0]
+    merc_s = np.log(np.tan(np.pi / 4.0 + np.radians(south) / 2.0))
+    merc_n = np.log(np.tan(np.pi / 4.0 + np.radians(north) / 2.0))
+
+    y_merc = merc_n - (np.arange(h) + 0.5) / h * (merc_n - merc_s)
+    lats = np.degrees(2.0 * np.arctan(np.exp(y_merc)) - np.pi / 2.0)
+    src_rows = (north - lats) / (north - south) * h - 0.5
+    idx = np.clip(np.round(src_rows).astype(int), 0, h - 1)
+    return data_clip[idx, :]
+
+
+def creer_image_overlay_uri(data_clip, south, north, vmin, vmax, cmap_nom="YlOrRd"):
+    """Crée un PNG transparent calé au pixel près en Web Mercator pour la carte interactive."""
+    data_merc = projeter_en_web_mercator(data_clip, south, north)
     cmap = mpl.colormaps[cmap_nom]
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
-    rgba = cmap(norm(np.nan_to_num(data_clip, nan=vmin)))
-    rgba[..., 3] = np.where(np.isnan(data_clip), 0.0, 1.0)
+    rgba = cmap(norm(np.nan_to_num(data_merc, nan=vmin)))
+    rgba[..., 3] = np.where(np.isnan(data_merc), 0.0, 1.0)
     rgba_uint8 = (rgba * 255).astype(np.uint8)
 
     img = Image.fromarray(rgba_uint8, mode="RGBA")
@@ -235,8 +309,9 @@ def creer_image_overlay_uri(data_clip, vmin, vmax, cmap_nom="YlOrRd"):
 
 
 def extraire_vitesse_pixel(data, transform, extent, lon, lat, dans_benin):
-    """Extrait la vitesse du raster au point (lon, lat), avec tolérance en bordure côtière."""
-    if not ((extent[0] <= lon <= extent[1]) and (extent[2] <= lat <= extent[3])):
+    """Extrait la vitesse du raster standardisé Nord->Sud au point (lon, lat)."""
+    west, east, south, north = extent
+    if not ((west <= lon <= east) and (south <= lat <= north)):
         return np.nan, False
 
     row, col = rasterio.transform.rowcol(transform, lon, lat)
@@ -256,7 +331,6 @@ def extraire_vitesse_pixel(data, transform, extent, lon, lat, dans_benin):
 
 
 def calculer_weibull_et_aep(v_moy, dept_nom, spec):
-    """Calcule Weibull (k, c), DPE (W/m²), AEP (MWh/an), Facteur de charge (%) et CO2 évité (t/an)."""
     est_cotier = normaliser_nom(dept_nom) in {"littoral", "atlantique", "oueme", "mono"}
     k = 2.85 if est_cotier else 2.35
     c = v_moy / gamma(1.0 + 1.0 / k)
@@ -280,8 +354,26 @@ def calculer_weibull_et_aep(v_moy, dept_nom, spec):
     return k, c, dpe, v_grid, pdf, p_courbe, fc_pct, aep_mwh, co2_t
 
 
+def generer_legende_html(vmin, vmax, alt_label, cmap_nom="YlOrRd"):
+    cmap = mpl.colormaps[cmap_nom]
+    stops = [mcolors.to_hex(cmap(x)) for x in np.linspace(0, 1, 9)]
+    grad_css = ", ".join(stops)
+    vals = np.linspace(vmin, vmax, 6)
+    ticks_html = "".join([f"<span>{v:.2f}</span>" for v in vals])
+    return f"""
+    <div class="legend-box">
+        <div class="legend-title">
+            <span>Légende — Vitesse moyenne du vent à {alt_label} (m/s)</span>
+            <span style="color:#64748b; font-weight:500;">Modèle XGBoost</span>
+        </div>
+        <div class="legend-bar" style="background: linear-gradient(to right, {grad_css});"></div>
+        <div class="legend-ticks">{ticks_html}</div>
+    </div>
+    """
+
+
 # ==============================================================================
-# INITIALISATION DES DONNÉES ET DE L'ÉTAT DE SESSION (SYNCHRONISATION CLIC)
+# INITIALISATION DES DONNÉES & SYNCHRONISATION DES CLICS
 # ==============================================================================
 if not os.path.exists(GEOJSON_BENIN):
     st.error(f"Fichier GeoJSON introuvable : {GEOJSON_BENIN}")
@@ -302,7 +394,7 @@ if "mode_sel" not in st.session_state:
 if "lat_sel" not in st.session_state:
     st.session_state["lat_sel"] = 6.3700
 if "lon_sel" not in st.session_state:
-    st.session_state["lon_sel"] = 2.4200
+    st.session_state["lon_sel"] = 2.4000
 if "last_map_click" not in st.session_state:
     st.session_state["last_map_click"] = None
 if "pending_click" in st.session_state and st.session_state["pending_click"] is not None:
@@ -313,7 +405,7 @@ if "pending_click" in st.session_state and st.session_state["pending_click"] is 
     st.session_state["pending_click"] = None
 
 # ==============================================================================
-# BARRE LATÉRALE : SÉLECTION SPATIALE & PARAMÈTRES TECHNIQUES
+# BARRE LATÉRALE : SÉLECTION SPATIALE & PARAMÈTRES
 # ==============================================================================
 st.sidebar.header("📍 1. Localisation du Site")
 mode_sel = st.sidebar.radio("Mode de sélection :", MODES, key="mode_sel")
@@ -346,7 +438,7 @@ elif mode_sel == "📡 Par Station ASECNA":
 
 else:
     if mode_sel == "🖱️ Clic direct sur la carte":
-        st.sidebar.info("💡 Cliquez directement sur n'importe quel point de la carte du Bénin pour l'analyser.")
+        st.sidebar.info("💡 Cliquez directement sur n'importe quel point du Bénin sur la carte pour l'analyser.")
         lat_sel = float(st.session_state["lat_sel"])
         lon_sel = float(st.session_state["lon_sel"])
         st.sidebar.caption(f"Point actif : **{lat_sel:.4f}°N, {lon_sel:.4f}°E**")
@@ -384,10 +476,11 @@ turb_nom = st.sidebar.selectbox("Aérogénérateur de référence :", list(TURBI
 scen = st.sidebar.selectbox("Horizon & Scénario Climatique :", list(SCENARIOS.keys()))
 
 st.sidebar.markdown("---")
-st.sidebar.header("🗺️ 3. Habillage de la Carte")
+st.sidebar.header("🌍 3. Globe & Habillage")
+fond_choisi = st.sidebar.selectbox("Fond de carte (Globe) :", list(FONDS_CARTE.keys()), index=0)
 afficher_noms_dept = st.sidebar.checkbox("Afficher les noms des départements", value=True)
 afficher_stations = st.sidebar.checkbox("Afficher les 6 stations ASECNA", value=True)
-opacite_raster = st.sidebar.slider("Opacité de la couche vent :", min_value=0.35, max_value=0.95, value=0.78, step=0.05)
+opacite_raster = st.sidebar.slider("Opacité de la couche vent :", min_value=0.35, max_value=0.95, value=0.80, step=0.05)
 
 facteur_scen = SCENARIOS[scen]
 tif_path = RASTERS_VITESSE[alt]
@@ -399,6 +492,8 @@ if not os.path.exists(tif_path):
 # EXTRACTION DU RASTER & CALCULS PHYSIQUES
 # ==============================================================================
 data_brut, extent, transform_brut = charger_raster_brut(tif_path)
+west, east, south, north = extent
+
 data_brut_scen = data_brut * facteur_scen
 data_clip_base, _ = preparer_raster_lisse_clippe(tif_path, GEOJSON_BENIN)
 data_clip_scen = data_clip_base * facteur_scen
@@ -409,7 +504,7 @@ if vmax_map <= vmin_map:
     vmin_map, vmax_map = float(np.nanmin(data_clip_scen)), float(np.nanmax(data_clip_scen))
 
 v_moy, est_voisin = extraire_vitesse_pixel(data_brut_scen, transform_brut, extent, lon_sel, lat_sel, dans_benin)
-point_valide = not np.isnan(v_moy)
+point_valide = (not np.isnan(v_moy)) and dans_benin
 
 spec = TURBINES[turb_nom]
 if point_valide:
@@ -459,10 +554,8 @@ if point_valide:
         """,
         unsafe_allow_html=True,
     )
-    if not dans_benin:
-        st.caption("ℹ️ Point situé en bordure frontalière immédiate (valeur extraite du pixel valide adjacent).")
-    elif est_voisin:
-        st.caption("ℹ️ Point littoral/frontalier : valeur calculée sur le pixel valide immédiatement voisin.")
+    if est_voisin:
+        st.caption("ℹ️ Point littoral/frontalier : valeur calculée sur le pixel valide immédiatement adjacent.")
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Vitesse moyenne", f"{v_moy:.2f} m/s")
@@ -473,47 +566,50 @@ if point_valide:
     k6.metric("Weibull (k / c)", f"k={k:.2f} | c={c:.2f}")
 else:
     st.warning(
-        f"⚠️ Le point cliqué (`{lat_sel:.4f}°N, {lon_sel:.4f}°E`) est **hors du territoire du Bénin**. "
-        "Cliquez à l'intérieur des frontières du Bénin sur la carte ci-dessous pour afficher les indicateurs."
+        f"⚠️ Le point sélectionné (`{lat_sel:.4f}°N, {lon_sel:.4f}°E`) se trouve **en dehors des frontières du Bénin**. "
+        "Cliquez à l'intérieur du territoire béninois sur la carte ci-dessous pour afficher les calculs."
     )
 
 # ==============================================================================
-# ESPACE PRINCIPAL : CARTE INTERACTIVE (GAUCHE) + ANALYSES & ATLAS HD (DROITE)
+# ESPACE PRINCIPAL : CARTE INTERACTIVE DU GLOBE (GAUCHE) + ANALYSES (DROITE)
 # ==============================================================================
-col_gauche, col_droite = st.columns([1.05, 1.25], gap="medium")
+col_gauche, col_droite = st.columns([1.08, 1.22], gap="medium")
 
 with col_gauche:
-    st.subheader(f"🗺️ Carte Interactive du Bénin ({alt})")
-    st.caption("Cliquez sur n'importe quel endroit du Bénin pour mettre à jour instantanément tous les calculs.")
+    st.subheader(f"🌍 Carte Interactive du Bénin ({alt})")
+    st.caption("Survolez un département pour voir son nom ou cliquez n'importe où au Bénin pour analyser le site.")
 
-    # Construction de la carte Folium épurée (CartoDB Positron)
+    cfg_fond = FONDS_CARTE[fond_choisi]
     m = folium.Map(
-        location=[9.35, 2.30],
+        location=[9.30, 2.30],
         zoom_start=7,
-        tiles="CartoDB positron",
+        min_zoom=4,
+        max_zoom=13,
+        tiles=cfg_fond["tiles"],
+        attr=cfg_fond["attr"],
         control_scale=True,
         prefer_canvas=True,
     )
 
-    # 1. Couche Raster XGBoost lissée et découpée au millimètre sur le Bénin
-    img_uri = creer_image_overlay_uri(data_clip_scen, vmin_map, vmax_map, cmap_nom="YlOrRd")
+    # 1. Couche Raster XGBoost lissée, orientée Nord->Sud, découpée au Bénin et calée Web Mercator
+    img_uri = creer_image_overlay_uri(data_clip_scen, south, north, vmin_map, vmax_map, cmap_nom="YlOrRd")
     folium.raster_layers.ImageOverlay(
         name=f"Vitesse du vent ({alt})",
         image=img_uri,
-        bounds=[[extent[2], extent[0]], [extent[3], extent[1]]],
+        bounds=[[south, west], [north, east]],
         opacity=opacite_raster,
         interactive=False,
         zindex=2,
     ).add_to(m)
 
-    # 2. Limites des 12 départements avec surbrillance et info-bulle au survol
+    # 2. Limites des 12 départements + surbrillance du département actif + infobulle au survol
     dept_actif_norm = normaliser_nom(dept)
 
     def style_departement(feature):
         nom_d = feature["properties"].get("Departement", "")
         if normaliser_nom(nom_d) == dept_actif_norm:
-            return {"fillColor": "transparent", "color": "#0d47a1", "weight": 2.6, "fillOpacity": 0.0}
-        return {"fillColor": "transparent", "color": "#334155", "weight": 1.0, "fillOpacity": 0.0}
+            return {"fillColor": "transparent", "color": "#0d47a1", "weight": 2.8, "fillOpacity": 0.0}
+        return {"fillColor": "transparent", "color": "#1e293b", "weight": 1.0, "fillOpacity": 0.0}
 
     folium.GeoJson(
         gdf_benin.__geo_interface__,
@@ -523,55 +619,60 @@ with col_gauche:
         tooltip=folium.GeoJsonTooltip(
             fields=["Departement"],
             aliases=["Département :"],
-            style="background-color:white; color:#0f172a; font-weight:600; font-size:12px; border:1px solid #cbd5e1;",
+            style="background-color:white; color:#0f172a; font-weight:700; font-size:12px; border:1px solid #cbd5e1; padding:4px 8px;",
         ),
     ).add_to(m)
 
     # 3. Frontière nationale extérieure renforcée
     folium.GeoJson(
         gdf_frontiere.__geo_interface__,
-        name="Frontière Nationale",
-        style_function=lambda _: {"fillColor": "transparent", "color": "#0f172a", "weight": 2.2, "fillOpacity": 0.0},
+        name="Frontière Nationale du Bénin",
+        style_function=lambda _: {"fillColor": "transparent", "color": "#0f172a", "weight": 2.4, "fillOpacity": 0.0},
         interactive=False,
     ).add_to(m)
 
-    # 4. Noms des départements lisibles et non surchargés (les 6 grands en direct, les 6 petits du Sud compacts)
+    # 4. Noms des départements bien espacés et lisibles (sans surcharge au Sud)
     if afficher_noms_dept:
-        decalages_folium = {
-            "littoral":   (6.31, 2.42),
-            "atlantique": (6.68, 2.18),
-            "oueme":      (6.58, 2.55),
-            "mono":       (6.52, 1.82),
-            "couffo":     (7.02, 1.80),
-            "plateau":    (7.22, 2.66),
+        positions_propres = {
+            "alibori":    (11.15, 2.85, "11px"),
+            "atacora":    (10.50, 1.55, "11px"),
+            "borgou":     (9.60,  2.72, "11px"),
+            "donga":      (9.35,  1.68, "10.5px"),
+            "collines":   (8.18,  2.22, "10.5px"),
+            "zou":        (7.32,  2.08, "10px"),
+            "plateau":    (7.15,  2.66, "9.5px"),
+            "couffo":     (7.00,  1.72, "9.5px"),
+            "kouffo":     (7.00,  1.72, "9.5px"),
+            "mono":       (6.55,  1.74, "9.5px"),
+            "atlantique": (6.68,  2.18, "9.5px"),
+            "oueme":      (6.62,  2.58, "9.5px"),
+            "littoral":   (6.27,  2.42, "9px"),
         }
         for _, row_d in gdf_benin.iterrows():
             nom_d = row_d["Departement"]
             cle_d = normaliser_nom(nom_d)
-            if cle_d in decalages_folium:
-                lbl_lat, lbl_lon = decalages_folium[cle_d]
-                taille_txt = "9.5px"
+            if cle_d in positions_propres:
+                lbl_lat, lbl_lon, taille_txt = positions_propres[cle_d]
             else:
                 pt_d = row_d.geometry.representative_point()
-                lbl_lat, lbl_lon = pt_d.y, pt_d.x
-                taille_txt = "11px"
+                lbl_lat, lbl_lon, taille_txt = pt_d.y, pt_d.x, "10.5px"
 
             folium.Marker(
                 location=[lbl_lat, lbl_lon],
                 icon=folium.DivIcon(
                     html=(
-                        f'<div style="font-size:{taille_txt}; font-weight:700; color:#111827; '
+                        f'<div style="font-size:{taille_txt}; font-weight:700; color:#0f172a; '
                         f'text-align:center; white-space:nowrap; pointer-events:none; '
                         f'transform:translate(-50%, -50%); '
-                        f'text-shadow: -1px -1px 2px #fff, 1px -1px 2px #fff, '
-                        f'-1px 1px 2px #fff, 1px 1px 2px #fff, 0 0 4px #fff;">'
+                        f'text-shadow: -1.5px -1.5px 2px #fff, 1.5px -1.5px 2px #fff, '
+                        f'-1.5px 1.5px 2px #fff, 1.5px 1.5px 2px #fff, 0 0 4px #fff;">'
                         f'{nom_d}</div>'
                     )
                 ),
                 interactive=False,
             ).add_to(m)
 
-    # 5. Marqueurs discrets des 6 stations ASECNA
+    # 5. Marqueurs des 6 stations ASECNA
     if afficher_stations:
         for st_nom, st_info in STATIONS_ASECNA.items():
             folium.CircleMarker(
@@ -588,29 +689,20 @@ with col_gauche:
     # 6. Marqueur principal du point analysé
     popup_html = (
         f"<b>{nom_site}</b><br>Département : {dept}<br>"
-        f"Vitesse ({alt}) : <b>{v_moy:.2f} m/s</b><br>DPE : <b>{dpe:.1f} W/m²</b><br>AEP : <b>{aep_mwh:,.1f} MWh/an</b>"
+        f"Vitesse ({alt}) : <b>{v_moy:.2f} m/s</b><br>"
+        f"DPE : <b>{dpe:.1f} W/m²</b><br>"
+        f"AEP : <b>{aep_mwh:,.1f} MWh/an</b>"
         if point_valide
         else f"<b>Point hors Bénin</b><br>{lat_sel:.4f}°N, {lon_sel:.4f}°E"
     )
     folium.Marker(
         location=[lat_sel, lon_sel],
         popup=folium.Popup(popup_html, max_width=240),
-        tooltip=f"Point actif ({lat_sel:.3f}°N, {lon_sel:.3f}°E)",
+        tooltip=f"Point actif : {lat_sel:.3f}°N, {lon_sel:.3f}°E",
         icon=folium.Icon(color="blue" if point_valide else "red", icon="crosshairs", prefix="fa"),
     ).add_to(m)
 
-    # 7. Barre de légende colorimétrique intégrée
-    cmap_mpl = mpl.colormaps["YlOrRd"]
-    couleurs_hex = [mcolors.to_hex(cmap_mpl(x)) for x in np.linspace(0, 1, 8)]
-    legende_cm = cm_branca.LinearColormap(
-        colors=couleurs_hex,
-        vmin=round(vmin_map, 2),
-        vmax=round(vmax_map, 2),
-        caption=f"Vitesse moyenne à {alt} (m/s)",
-    )
-    legende_cm.add_to(m)
-
-    # Affichage interactif et écoute des clics souris
+    # Affichage de la carte interactive (avec clic souris)
     retour_carte = st_folium(
         m,
         height=640,
@@ -618,6 +710,9 @@ with col_gauche:
         returned_objects=["last_clicked"],
         key="carte_interactive_benin",
     )
+
+    # Légende colorimétrique propre juste en dessous (zéro chevauchement avec la carte !)
+    st.markdown(generer_legende_html(vmin_map, vmax_map, alt, "YlOrRd"), unsafe_allow_html=True)
 
     if retour_carte and retour_carte.get("last_clicked"):
         click_lat = round(float(retour_carte["last_clicked"]["lat"]), 4)
@@ -650,7 +745,6 @@ with col_droite:
             ax1.tick_params(axis="y", labelcolor="#1565c0")
             ax1.grid(True, linestyle=":", alpha=0.45)
 
-            # Second axe : Courbe de puissance de l'aérogénérateur
             ax2 = ax1.twinx()
             ax2.plot(v_grid, p_courbe, color="#ea580c", lw=2.0, linestyle="-.", label=f"Courbe {spec['P_nom']:.0f} kW")
             ax2.set_ylabel("Puissance électrique (kW)", fontsize=9.5, color="#ea580c", fontweight="bold")
@@ -684,7 +778,7 @@ with col_droite:
         else:
             st.info("Sélectionnez un point à l'intérieur du Bénin pour afficher la loi de Weibull et la fiche technique.")
 
-    # --- ONGLET 2 : PROFIL VERTICAL MULTI-ALTITUDES AU POINT SÉLECTIONNÉ ---
+    # --- ONGLET 2 : PROFIL VERTICAL MULTI-ALTITUDES ---
     with tab_profil:
         if point_valide:
             lignes_prof = []
@@ -738,24 +832,26 @@ with col_droite:
     with tab_atlas:
         fig_hd, ax_hd = plt.subplots(figsize=(6.4, 7.6), dpi=150)
         fig_hd.patch.set_facecolor("white")
-        ax_hd.set_facecolor("#ffffff")
+        ax_hd.set_facecolor("#f8fafc")
 
-        # Raster lissé et découpé strictement sur le Bénin
+        # Bande bleue très douce au Sud pour figurer l'Océan Atlantique
+        ax_hd.axhspan(5.50, 6.45, color="#e0f2fe", alpha=0.75, zorder=0)
+
+        # Raster lissé, orienté Nord->Sud et découpé strictement sur les frontières du Bénin
         im_hd = ax_hd.imshow(
             data_clip_scen, cmap="YlOrRd", extent=extent, origin="upper",
             vmin=vmin_map, vmax=vmax_map, interpolation="bilinear", zorder=2,
         )
 
-        # Limites départementales fines + frontière nationale épaisse + département actif
+        # Limites départementales + frontière nationale + département sélectionné
         gdf_benin.plot(ax=ax_hd, facecolor="none", edgecolor="#334155", linewidth=0.75, zorder=3)
-        gdf_frontiere.plot(ax=ax_hd, facecolor="none", edgecolor="#0f172a", linewidth=1.7, zorder=4)
+        gdf_frontiere.plot(ax=ax_hd, facecolor="none", edgecolor="#0f172a", linewidth=1.8, zorder=4)
         if not sub_gdf.empty:
             sub_gdf.plot(ax=ax_hd, facecolor="none", edgecolor="#0d47a1", linewidth=2.3, zorder=5)
 
-        # Halo blanc autour des textes pour une lisibilité parfaite
         halo = [pe.withStroke(linewidth=2.6, foreground="white")]
 
-        # Étiquettes des 12 départements sans aucun chevauchement (lignes de rappel au Sud)
+        # Noms des 12 départements sans chevauchement (lignes de rappel au Sud)
         if afficher_noms_dept:
             for _, row_d in gdf_benin.iterrows():
                 nom_d = row_d["Departement"]
@@ -785,14 +881,13 @@ with col_droite:
                         path_effects=halo, zorder=8,
                     )
 
-        # Repères discrets des pays voisins et de l'Océan Atlantique
-        ax_hd.text(0.88, 9.20, "TOGO", color="#94a3b8", fontsize=9, fontweight="bold", rotation=86, ha="center")
-        ax_hd.text(1.30, 11.75, "BURKINA FASO", color="#94a3b8", fontsize=8, fontweight="bold", ha="center")
-        ax_hd.text(3.38, 12.18, "NIGER", color="#94a3b8", fontsize=9, fontweight="bold", ha="center")
-        ax_hd.text(3.82, 9.25, "NIGÉRIA", color="#94a3b8", fontsize=9, fontweight="bold", rotation=-88, ha="center")
-        ax_hd.text(2.30, 5.74, "OCÉAN ATLANTIQUE", color="#3b82f6", fontsize=8.5, style="italic", fontweight="bold", ha="center")
+        # Noms des pays limitrophes et de l'Océan Atlantique à leurs emplacements exacts
+        ax_hd.text(0.86, 9.20, "TOGO", color="#64748b", fontsize=9, fontweight="bold", rotation=86, ha="center")
+        ax_hd.text(1.32, 11.78, "BURKINA FASO", color="#64748b", fontsize=8, fontweight="bold", ha="center")
+        ax_hd.text(3.40, 12.18, "NIGER", color="#64748b", fontsize=9, fontweight="bold", ha="center")
+        ax_hd.text(3.84, 9.25, "NIGÉRIA", color="#64748b", fontsize=9, fontweight="bold", rotation=-88, ha="center")
+        ax_hd.text(2.30, 5.74, "OCÉAN ATLANTIQUE", color="#0284c7", fontsize=8.5, style="italic", fontweight="bold", ha="center")
 
-        # Stations ASECNA
         if afficher_stations:
             st_lons = [v["lon"] for v in STATIONS_ASECNA.values()]
             st_lats = [v["lat"] for v in STATIONS_ASECNA.values()]
@@ -801,20 +896,19 @@ with col_droite:
                 color="white", edgecolor="#0f172a", s=34, linewidth=1.0, zorder=9, label="Stations ASECNA",
             )
 
-        # Marqueur du point analysé
         ax_hd.scatter(
             [lon_sel], [lat_sel],
             color="#00e5ff", edgecolor="#0f172a", marker="*", s=210, linewidth=1.1, zorder=11, label="Site sélectionné",
         )
 
-        # Flèche du Nord (en haut à gauche)
+        # Flèche du Nord
         ax_hd.annotate(
-            "N", xy=(0.86, 12.32), xytext=(0.86, 11.75),
+            "N", xy=(0.84, 12.32), xytext=(0.84, 11.75),
             arrowprops=dict(facecolor="#0f172a", width=3.5, headwidth=9, headlength=9),
             ha="center", va="center", fontsize=10, fontweight="bold", color="#0f172a", zorder=10,
         )
 
-        # Barre d'échelle graphique (~100 km à ~9°N ≈ 0.91°)
+        # Barre d'échelle 100 km
         ax_hd.plot([3.00, 3.91], [5.86, 5.86], color="#0f172a", lw=2.5, zorder=10)
         ax_hd.plot([3.00, 3.00], [5.82, 5.90], color="#0f172a", lw=1.4, zorder=10)
         ax_hd.plot([3.91, 3.91], [5.82, 5.90], color="#0f172a", lw=1.4, zorder=10)
@@ -836,7 +930,6 @@ with col_droite:
         cbar.set_label("Vitesse moyenne du vent (m/s)", fontsize=8.5, fontweight="bold")
         fig_hd.tight_layout()
 
-        # Préparation du téléchargement PNG Haute Définition (300 DPI)
         buf_hd = io.BytesIO()
         fig_hd.savefig(buf_hd, format="PNG", dpi=300, bbox_inches="tight", facecolor="white")
         st.pyplot(fig_hd)
